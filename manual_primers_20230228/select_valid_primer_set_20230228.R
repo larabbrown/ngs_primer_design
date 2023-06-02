@@ -211,20 +211,20 @@ df_chosen_primers %>%
 
 # problems
 # 14R has to be 0 or 1 -> set to 0, and change 8R2 -> 8R3 (no solution to help interaction with 12R1; using 12R2 kept interaction and 12R3 had bad interactions with others)
-# 16L has to be 1,2,3 -> 
-## 16L3 has -7.04 for everything except with 18R1 at -7.14
-## 16L1 has -7.01 with one interaction with 3L1 at -7.17
-## 16L2 has -7.24
-## 16L0 has -6.99, but has one interaction with 13R0 at -11.7
+# 16L has to be 1,2,3 ->
+# 16L3 has -7.04 for everything except with 18R1 at -7.14
+# 16L1 has -7.01 with one interaction with 3L1 at -7.17
+# 16L2 has -7.24
+# 16L0 has -6.99, but has one interaction with 13R0 at -11.7
 # 20R has to be 0,1
 
 # if set 20R0, need to change 5R0 and 14R0 (but can't change 14R0). 5R1 is only other option and it has numerous bad interactions
 # if set 20R1, need to change 4R1, 15R1, 1L1
 # changing 4R1 to ...
-## 4R0 <-> 3L1 -7.7; 
-## 4R2 <-> 5L1 -7.53; 
-## 4R3 <-> 4L4 -7.05;
-## 4R4 <-> 5L1 -7 and 4R4 <-> 18R1 -8.13
+# 4R0 <-> 3L1 -7.7;
+# 4R2 <-> 5L1 -7.53;
+# 4R3 <-> 4L4 -7.05;
+# 4R4 <-> 5L1 -7 and 4R4 <-> 18R1 -8.13
 # 15R: 15R0 is only other option and it has -10.8 for almost everything
 # 1L: 1L1 resolves 20R1 interaction
 

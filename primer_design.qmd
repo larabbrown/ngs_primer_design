@@ -1,0 +1,322 @@
+---
+title: "Primer Design"
+author: "Lara Brown"
+date: 2023-06-02
+date-format: medium
+format: html
+editor: visual
+---
+
+```{r}
+#| include: FALSE
+#| warning: FALSE
+
+library(dplyr)
+library(magrittr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(openPrimeR)
+library(seqinr)
+source("functions_primer_selection.R")
+
+options(dplyr.summarise.inform = FALSE)
+```
+
+
+This notebook, along with the README in this repository, provides an overview of primer generation for multiplex PCR, when the interactions/dimer formation of multiple sets of primers is a concern. This combination of an initial pipeline followed by a number of more qualitative/manual steps ideally generates primers for a number of different targets, none of which form cross-dimers with low enough Gibbs free energies to be of concern in an experimental setting.
+
+For the actual primer generation process for a specific project, see the R file and associated data files in the `manual_primers_20230228` subdirectory. Most of that code is included here, but it contains some additional messy details and processing.
+
+## Generating a primer set with Primer3
+
+Utilize the web interface of primer3 to generate an initial primer set containing up to five ranked primer pairs per target. Note that while primer3 can also be run through the command line, the default arguments seem to be different; until we can figure out exactly how to replicate our preferred settings, it's easy enough to just run it through the web interface.
+
+See "primer3 settings for NGS primers.pptx" for more info.
+
+## Running PrimerDimer
+
+Once we have all our potential primers, we wish to calculate the cross-dimerization energies of all possible pairs of primers in the set. For this, we'll use a program called PrimerDimer.
+
+First, reformat the primer3 output into FASTA format:
+
+```{r}
+#| eval: FALSE
+
+df_primer <- read_csv("manual_primers_20230228/manual_primers_20230228.csv")
+df_primers_formatted <- df_primer %>% 
+  mutate(fasta_header = paste(Target, oligo, Rank, sep="|")) %>% 
+  select(fasta_header, seq)
+write.fasta(as.list(df_primers_formatted$seq), as.list(df_primers_formatted$fasta_header), "manual_primers_20230228/primer-dimer_input.fasta")
+```
+
+Then, navigate to [primer-dimer.com](primer-dimer.com). Copy and paste the FASTA file into the input box. Select "multiplex analysis" and "excel summary report," and run, saving the results into a csv file. Finally, read in the PrimerDimer predictions as a dataframe:
+
+```{r}
+df_dimer <- read_csv("manual_primers_20230228/dimer_prediction_report_20230228.csv")
+```
+
+Reformat this dataframe into a long format representation of a symmetric matrix. Each interaction between Primer X and Primer Y should be represented twice in the dataframe, once with Primer X in the `_a` position, and once with Primer X in the `_b` position. The identifying fields (target, direction, and pair number) are also split into three separate columns instead of the PrimerDimer format of a single string.
+
+```{r}
+df_dimer_lower <- df_dimer %>% 
+  separate_wider_delim("Forward Primer Name", "|", names=c("id_target_a", "direction_a", "id_pair_a")) %>% 
+  separate_wider_delim("Reverse Primer Name", "|", names=c("id_target_b", "direction_b", "id_pair_b")) %>% 
+  select(id_target_a, direction_a, id_pair_a, id_target_b, direction_b, id_pair_b, dG)
+
+df_dimer_upper <- df_dimer_lower %>% 
+  rename(id_target_a = id_target_b,
+         id_target_b = id_target_a,
+         id_pair_a = id_pair_b,
+         id_pair_b = id_pair_a,
+         direction_a = direction_b,
+         direction_b = direction_a) %>% 
+  select(id_target_a, direction_a, id_pair_a, id_target_b, direction_b, id_pair_b, dG) # ensure column order matches lower tri
+
+df_dimer_symmetric <- rbind(df_dimer_lower, df_dimer_upper)
+```
+
+## Quick Validation
+
+Quickly check a known pair to verify that it indeed appears twice with the same dG value in the dataframe:
+
+```{r}
+df_dimer_symmetric %>% 
+  filter((id_target_a == 12 & direction_a == "RIGHT" & id_pair_a == 3 & id_target_b == 7 & direction_b == "LEFT" & id_pair_b == 0) |
+         (id_target_a == 7 & direction_a == "LEFT" & id_pair_a == 0 & id_target_b == 12 & direction_b == "RIGHT" & id_pair_b == 3)) %>% 
+  View()
+
+```
+
+## Hard filtering
+
+To begin, we remove any primers with an average dG across all their interactions less than or equal to -7.
+
+First, create a dataframe of all the valid primers (primers that do not fail this check):
+
+```{r}
+df_valid_primers <- df_dimer_symmetric %>% 
+  group_by(id_target_a, direction_a, id_pair_a) %>% 
+  summarize(n = n(),
+            avg = mean(dG, na.rm = TRUE),
+            n_below_neg10 = sum(dG <= -10),
+            n_below_neg7 = sum(dG <= -7),
+            n_below_neg6 = sum(dG <= -6)) %>%
+  filter(avg >= -7) %>% 
+  select(id_target_a, direction_a, id_pair_a) %>% 
+  rename(target = id_target_a,
+         direction = direction_a,
+         pair = id_pair_a) %>% 
+  mutate(retain = TRUE)
+```
+
+Next, filter the "symmetric" dataframe so it only includes pairs where both primers are in the valid set:
+
+```{r}
+df_valid_pairs <- df_dimer_symmetric %>% 
+  left_join(df_valid_primers,
+            by=c("id_target_a" = "target",
+                 "direction_a" = "direction",
+                 "id_pair_a" = "pair"),
+            multiple="all") %>% 
+  filter(retain) %>% 
+  left_join(df_valid_primers,
+            by=c("id_target_b" = "target",
+                 "direction_b" = "direction",
+                 "id_pair_b" = "pair"),
+            multiple="all",
+            suffix=c(".sym", ".val")) %>% 
+  filter(retain.val) %>% 
+  select(-retain.sym, -retain.val)
+```
+
+## Recursive filtering
+
+We now successively filter the primer dataframe, culling "bad" interactions, until we are left with a set of pairs with no cross-dimers with Gibbs free energies less than a set threshold (-7 in this case). However, note that we may lose some targets entirely in the process. In the example below, we see that we are usually left with fewer than the desired 40 targets:
+
+```{r}
+#| warning: FALSE
+
+func_recurs_filter_primers(df_valid_pairs, -7) %>% 
+  func_count_targets()
+```
+
+Therefore, we run this filtering process repeatedly, 300 times, and choose the set that retains the most targets:
+
+```{r}
+#| eval: FALSE
+
+df_selected_set <- func_get_best_run(df_valid_pairs, 300, -9, random=TRUE)
+write_csv(df_selected_set, "manual_primers_20230228/init_set_20230301.csv")
+```
+
+We can save this dataframe, and in the future, read it back in so we don't have to rerun this step.
+
+```{r}
+df_selected_set <- read_csv("manual_primers_20230228/init_set_20230301.csv")
+```
+
+## Filling in the gaps
+
+As mentioned, at this point, we've likely removed a number of targets entirely. We can easily figure out which targets are missing only a primer in one direction, and can visually assess which are missing entirely.
+
+```{r}
+df_missing_oneway <- df_selected_set %>% 
+  group_by(id_target_a) %>% 
+  summarize(n=n()) %>% 
+  filter(n == 1) %>% 
+  ungroup
+```
+
+### Overview of missing targets
+
+| Target | Direction |
+|:------:|:---------:|
+|   9    |   LEFT    |
+|   13   |   RIGHT   |
+|   15   |   BOTH    |
+|   14   |   BOTH    |
+|   16   |   LEFT    |
+|   20   |   BOTH    |
+
+### Pulling all valid primers for missing targets
+
+Return to the dataframe of valid primers (generated after hard filtering step) to figure out which primers we might include for these missing sites:
+
+```{r}
+df_missing_options <- df_valid_primers %>% 
+  filter((target == 9 & direction == "RIGHT") |
+         (target == 13 & direction == "RIGHT") |
+         (target == 16 & direction == "LEFT") |
+         (target == 14) |
+         (target == 15) |
+         (target == 20))
+```
+
+From this, we find our options are:
+
+| Target | Direction | Pair/rank id |
+|:------:|:---------:|:------------:|
+|   9    |   RIGHT   |     0,1      |
+|   13   |   RIGHT   |  0,1,2,3,4   |
+|   15   |   LEFT    |     0,1      |
+|   15   |   RIGHT   |      1       |
+|   14   |   LEFT    |     0,1      |
+|   14   |   RIGHT   |      0       |
+|   16   |   LEFT    |     none     |
+|   20   |   LEFT    |     0,1      |
+|   20   |   RIGHT   |     0,1      |
+
+Join these targets to our earlier selected set, and choose the best primer for each target-direction pair:
+
+```{r}
+df_full_set_to_eval <- tibble(id_target_a = c(9,13,13,13,13,13,15,15,15,14,14,14,20,20,16),
+                              direction_a = c("LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "LEFT", "LEFT", "RIGHT", "LEFT", "LEFT", "RIGHT", "LEFT", "RIGHT","LEFT"),
+                              id_pair_a = c(0,0,1,2,3,4,0,1,1,0,1,0,1,0,0),
+                              n = 10) %>% 
+  rbind(df_selected_set) %>% 
+  group_by(id_target_a, direction_a) %>% 
+  rename(id_target = id_target_a,
+         direction = direction_a,
+         id_pair = id_pair_a) %>% 
+  mutate(retain=TRUE,
+         id_target = as.character(id_target),
+         id_pair = as.character(id_pair)) %>% 
+  group_by(id_target, direction) %>% # choose best ranked primer for each target-direction pair
+  slice_min(order_by=id_pair)
+```
+
+### Identifying interactions across this reduced set
+
+At this point, we enter into a bit of a guess-and-check cycle, re-evaluting interactions in our chosen set until we settle on a set that mostly works.
+
+```{r}
+df_dimer_symmetric %>% 
+  left_join(df_full_set_to_eval, by=c("id_target_a" = "id_target", "direction_a" = "direction", "id_pair_a" = "id_pair")) %>% 
+  filter(retain) %>% 
+  select(-retain) %>% 
+  left_join(df_full_set_to_eval, by=c("id_target_b" = "id_target", "direction_b" = "direction", "id_pair_b" = "id_pair")) %>% 
+  filter(retain) %>%
+  select(-retain) %>% 
+  arrange(dG) %>% 
+  View()
+```
+
+We observe the following problematic interactions and note potential replacement options based on `df_selected_set`:
+
+|         Interaction         | Alternatives for A | Alternatives for B                 |
+|:----------------------------:|:--------------------|:--------------------|
+|  1R2 $\leftrightarrow$ 3L0  | 1R4                | 3L1, 3L3                           |
+| 12R1 $\leftrightarrow$ 14R0 | 12R2               | None                               |
+| 8R2 $\leftrightarrow$ 14R0  | 8R3, 8R4           | None                               |
+| 10R1 $\leftrightarrow$ 19R0 | **10R2**, 10R3     | 19R2                               |
+| 6R0 $\leftrightarrow$ 13R0  | 6R2                | 13R1,2,3,4 (all worse, keep as is) |
+|  9L0 $\leftrightarrow$ 5R0  | 9L1                | 5R1                                |
+
+Implement these desired replacements to improve the selected set:
+
+```{r}
+df_replacement <- tibble(id_target = c("3", "10", "8", "1", "4", "9"),
+                         direction = c("LEFT", "RIGHT", "RIGHT", "LEFT", "RIGHT", "LEFT"),
+                         id_pair = c("1", "2", "3", "0", "3", "1"),
+                         n = 10,
+                         retain = TRUE) %>% 
+  rbind(df_full_set_to_eval) %>% 
+  filter(!(id_target == "3" & direction == "LEFT" & id_pair == "0"),
+         # !(id_target == "14" & direction == "RIGHT" & id_pair == "0"),
+         !(id_target == "10" & direction == "RIGHT" & id_pair == "1"),
+         !(id_target == "8" & direction == "RIGHT" & id_pair == "2"),
+         !(id_target == "4" & direction == "RIGHT" & id_pair == "1"),
+         !(id_target == "1" & direction == "LEFT" & id_pair == "1"),
+         !(id_target == "9" & direction == "LEFT" & id_pair == "0"))
+```
+
+```{r}
+df_dimer_symmetric %>% 
+  left_join(df_replacement, by=c("id_target_a" = "id_target", "direction_a" = "direction", "id_pair_a" = "id_pair")) %>% 
+  filter(retain) %>% 
+  select(-retain) %>% 
+  left_join(df_replacement, by=c("id_target_b" = "id_target", "direction_b" = "direction", "id_pair_b" = "id_pair")) %>% 
+  filter(retain) %>%
+  select(-retain) %>% 
+  arrange(dG) %>% 
+  View()
+```
+
+I noted the following problems, which I just iterated on until I resolved them the best I could:
+
+-   14R has to be 0 or 1 $\rightarrow$ set to 0, and change 8R2 $\rightarrow$ 8R3 (no solution to help interaction with 12R1; using 12R2 kept interaction and 12R3 had bad interactions with others)
+-   16L has to be 1,2,3 $\rightarrow$
+    -   16L3 has -7.04 for everything except with 18R1 at -7.14
+    -   16L1 has -7.01 with one interaction with 3L1 at -7.17
+    -   16L2 has -7.24
+    -   16L0 has -6.99, but has one interaction with 13R0 at -11.7
+-   20R has to be 0,1
+    -   if set 20R0, need to change 5R0 and 14R0 (but can't change 14R0). 5R1 is only other option and it has numerous bad interactions
+    -   if set 20R1, need to change 4R1, 15R1, 1L1
+-   changing 4R1 to ...
+    -   4R0 $\leftrightarrow$ 3L1 -7.7;
+    -   4R2 $\leftrightarrow$ 5L1 -7.53;
+    -   4R3 $\leftrightarrow$ 4L4 -7.05;
+    -   4R4 $\leftrightarrow$ 5L1 -7 and 4R4 $\leftrightarrow$ 18R1 -8.13
+-   15R: 15R0 is only other option and it has -10.8 for almost everything
+-   1L: 1L1 resolves 20R1 interaction
+
+We can repeat this above process a few times, making slight changes, and save several different options for our primer sets:
+
+```{r}
+#| eval: FALSE
+write_csv(df_replacement, "manual_primers_20230228/chosen_primer_set_4.csv")
+```
+
+
+## Validating primer sets
+
+Previously, we used openPrimeR to visualize boxplots of dGs for each primer set to ensure all interactions fell above a reasonable threshold. (openPrimeR seemed to be less stringent than PrimerDimer in calculating free energies of dimer formation). Unfortunately, the OligoArrayAux dependency for these calculations is no longer available or supported, so we cannot replicate this step. I'm including the code below for reference anyway.
+
+```{r}
+#| eval: FALSE
+source("functions_check_opr_constraints.R")
+func_eval_primers_in_dir("manual_primers_20230228/chosen_primer_sets", "manual_primers_20230228/manual_primers_20230228.csv", "manual_primers_20230228/chosen_primer_fastas")
+```
